@@ -458,13 +458,15 @@ def setup_hotkeys():
         if key_lower in NUMPAD_MAP:
             sc = NUMPAD_MAP[key_lower]
             try:
-                keyboard.hook_key(sc, lambda e, s=stars: rate_song(s) if (e.event_type == "down" and getattr(e, "is_keypad", False)) else None)
+                # Differentiate standalone arrows vs numpad keys sharing same scan codes by checking e.is_keypad
+                # Run rating action in a separate thread to prevent blocking keyboard input thread
+                keyboard.hook_key(sc, lambda e, s=stars: threading.Thread(target=rate_song, args=(s,), daemon=True).start() if (e.event_type == "down" and getattr(e, "is_keypad", False)) else None)
                 logging.info(f"Hooked scan code {sc} ({key}) -> {stars} stars (keypad-only)")
             except Exception as e:
                 logging.error(f"Hook failed for {sc}: {e}")
         else:
             try:
-                keyboard.add_hotkey(key, lambda s=stars: rate_song(s), suppress=False)
+                keyboard.add_hotkey(key, lambda s=stars: threading.Thread(target=rate_song, args=(s,), daemon=True).start(), suppress=False)
                 logging.info(f"Hotkey '{key}' -> {stars} stars")
             except Exception as e:
                 logging.error(f"Hotkey failed for '{key}': {e}")
@@ -472,14 +474,14 @@ def setup_hotkeys():
     # 2. Setup history navigation keys
     try:
         sc_back = NUMPAD_MAP["numpad 7"]
-        keyboard.hook_key(sc_back, lambda e: navigate_history(1) if (e.event_type == "down" and getattr(e, "is_keypad", False)) else None)
+        keyboard.hook_key(sc_back, lambda e: threading.Thread(target=navigate_history, args=(1,), daemon=True).start() if (e.event_type == "down" and getattr(e, "is_keypad", False)) else None)
         logging.info("Hooked scan code 71 (numpad 7) -> History Back")
     except Exception as e:
         logging.error(f"Hook failed for numpad 7: {e}")
 
     try:
         sc_fwd = NUMPAD_MAP["numpad 9"]
-        keyboard.hook_key(sc_fwd, lambda e: navigate_history(-1) if (e.event_type == "down" and getattr(e, "is_keypad", False)) else None)
+        keyboard.hook_key(sc_fwd, lambda e: threading.Thread(target=navigate_history, args=(-1,), daemon=True).start() if (e.event_type == "down" and getattr(e, "is_keypad", False)) else None)
         logging.info("Hooked scan code 73 (numpad 9) -> History Forward")
     except Exception as e:
         logging.error(f"Hook failed for numpad 9: {e}")
