@@ -1,0 +1,5 @@
+# Plexamp Rater - Requirements
+plexapi
+keyboard
+python-dotenv
+Pillow
