@@ -75,11 +75,21 @@ HUD_WIDTH = 460
 HUD_HEIGHT = 120
 
 
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
+SWP_FRAMECHANGED = 0x0020
+
 def set_clickthrough(hwnd):
     """Add WS_EX_TRANSPARENT so clicks pass through."""
     try:
         style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_TRANSPARENT)
+        # Force frame style change to apply immediately
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, 0, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED
+        )
     except Exception as e:
         logging.error(f"Failed to set clickthrough: {e}")
 
@@ -192,10 +202,15 @@ def create_hud(title, artist, stars_str, instruction, border_color, img_obj=None
     # Apply click-through AFTER rendering
     set_clickthrough(int(win.wm_frame(), 16) if win.wm_frame() != "" else win.winfo_id())
 
+    # Explicitly show, raise, and force focus to top of Z-order
+    win.deiconify()
+    win.lift()
+    win.focus_force()
+
     return win
 
 
-def show_hud(title, artist, current_stars, highlight_rated=False, auto_hide_ms=None, album_art=None, is_history=False, history_pos=None):
+def show_hud(title, artist, current_stars, highlight_rated=False, auto_hide_ms=None, album_art=None, is_history=False, history_pos=None, instruction_override=None):
     """
     Show HUD by destroying any existing Toplevel and creating a fresh one with album art and history mode support.
     """
@@ -231,12 +246,16 @@ def show_hud(title, artist, current_stars, highlight_rated=False, auto_hide_ms=N
         border_color = "#00ff66"
         instruction = "Rating Updated Successfully!"
     else:
-        if is_history:
-            border_color = "#ffb000"  # Amber border in history mode
-            instruction = f"Press Numpad 1-5 to rate history (-{history_pos})"
+        if instruction_override:
+            border_color = "#00d2ff" if not is_history else "#ffb000"
+            instruction = instruction_override
         else:
-            border_color = "#00d2ff"  # Cyan border in normal mode
-            instruction = "Press Numpad 1-5 to rate"
+            if is_history:
+                border_color = "#ffb000"  # Amber border in history mode
+                instruction = f"Press Numpad 1-5 to rate history (-{history_pos})"
+            else:
+                border_color = "#00d2ff"  # Cyan border in normal mode
+                instruction = "Press Numpad 1-5 to rate"
 
     # Create a brand new window with the correct content
     hud_window = create_hud(title, artist, stars_str, instruction, border_color, album_art, is_history, history_pos)
@@ -275,7 +294,8 @@ def process_ui_queue():
                         msg.get("highlight", False), msg.get("duration"),
                         msg.get("album_art", None),
                         msg.get("is_history", False),
-                        msg.get("history_pos", None)
+                        msg.get("history_pos", None),
+                        msg.get("instruction_override", None)
                     )
                 except Exception as e:
                     logging.error(f"Error in show_hud: {e}", exc_info=True)
@@ -331,22 +351,28 @@ def navigate_history(direction):
     global history_index, recent_tracks, current_track_id, ui_queue
 
     with history_lock:
-        if not recent_tracks and history_index == -1:
-            logging.info("History is empty.")
-            return
-
         if direction == 1:  # Go older
-            if history_index == -1:
-                history_index = 0
+            if not recent_tracks:
+                # History is empty, fall back to showing current track and display message
+                history_index = -1
+                instruction_override = "No older songs in history"
             else:
-                history_index = min(len(recent_tracks) - 1, history_index + 1)
+                if history_index == -1:
+                    history_index = 0
+                    instruction_override = None
+                else:
+                    history_index = min(len(recent_tracks) - 1, history_index + 1)
+                    instruction_override = None
         elif direction == -1:  # Go newer
             if history_index == -1:
-                return
+                # Already at current track, just pull up the HUD for it
+                instruction_override = None
             elif history_index == 0:
                 history_index = -1
+                instruction_override = None
             else:
                 history_index -= 1
+                instruction_override = None
 
         # Trigger HUD view
         if history_index == -1:
@@ -360,6 +386,8 @@ def navigate_history(direction):
                     rating = getattr(track, "userRating", 0) or 0
                     stars = rating / 2.0
                     album_art = fetch_album_art(plex, track)
+                    
+                    inst = instruction_override if instruction_override else "Press Numpad 1-5 to rate"
                     ui_queue.put({
                         "action": "show",
                         "title": title,
@@ -367,7 +395,8 @@ def navigate_history(direction):
                         "stars": stars,
                         "album_art": album_art,
                         "duration": 5000,
-                        "is_history": False
+                        "is_history": False,
+                        "instruction_override": inst
                     })
                 except Exception as e:
                     logging.error(f"Error restoring current track display: {e}")
