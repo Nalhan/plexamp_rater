@@ -49,7 +49,8 @@ HOTKEYS = {
 
 NUMPAD_MAP = {
     "numpad 1": 79, "numpad 2": 80, "numpad 3": 81,
-    "numpad 4": 75, "numpad 5": 76, "numpad 0": 82
+    "numpad 4": 75, "numpad 5": 76, "numpad 0": 82,
+    "numpad 7": 71, "numpad 9": 73  # 7 = History Back, 9 = History Forward
 }
 
 # Win32
@@ -57,6 +58,12 @@ GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
 
 ui_queue = queue.Queue()
+
+# Thread synchronization and state variables
+history_lock = threading.Lock()
+recent_tracks = []   # List of dicts: [{"id", "title", "artist", "stars", "album_art"}]
+history_index = -1   # -1 means currently playing, 0 means most recent history, 1 older...
+
 current_track_id = None
 prompted_tracks = set()
 
@@ -64,7 +71,6 @@ root = None
 hud_window = None
 hide_timer_id = None
 
-# New HUD dimensions to accommodate album art cleanly
 HUD_WIDTH = 460
 HUD_HEIGHT = 120
 
@@ -92,7 +98,7 @@ def fetch_album_art(plex, item):
     return None
 
 
-def create_hud(title, artist, stars_str, instruction, border_color, img_obj=None):
+def create_hud(title, artist, stars_str, instruction, border_color, img_obj=None, is_history=False, history_pos=None):
     """
     Create a brand-new Toplevel HUD window with the correct text/image baked in.
     """
@@ -117,11 +123,19 @@ def create_hud(title, artist, stars_str, instruction, border_color, img_obj=None
     inner = tk.Frame(border_frame, bg="#0f0f12")
     inner.pack(fill="both", expand=True, padx=1, pady=1)
 
-    # Status bar
+    # Status bar (Color changes when viewing history vs live track)
     bar = tk.Frame(inner, bg="#1a1a22")
     bar.pack(fill="x", side="top")
-    tk.Label(bar, text="🎵 PLEXAMP SONG RATER",
-             font=("Segoe UI", 8, "bold"), fg="#00d2ff", bg="#1a1a22"
+    
+    if is_history:
+        status_text = f"📜 RATER HISTORY (-{history_pos})"
+        status_color = "#ffb000"  # Amber for history
+    else:
+        status_text = "🎵 PLEXAMP SONG RATER"
+        status_color = "#00d2ff"  # Cyan for live
+        
+    tk.Label(bar, text=status_text,
+             font=("Segoe UI", 8, "bold"), fg=status_color, bg="#1a1a22"
              ).pack(side="left", padx=10, pady=2)
 
     # Content area (horizontal split)
@@ -181,9 +195,9 @@ def create_hud(title, artist, stars_str, instruction, border_color, img_obj=None
     return win
 
 
-def show_hud(title, artist, current_stars, highlight_rated=False, auto_hide_ms=None, album_art=None):
+def show_hud(title, artist, current_stars, highlight_rated=False, auto_hide_ms=None, album_art=None, is_history=False, history_pos=None):
     """
-    Show HUD by destroying any existing Toplevel and creating a fresh one with album art.
+    Show HUD by destroying any existing Toplevel and creating a fresh one with album art and history mode support.
     """
     global hud_window, hide_timer_id
 
@@ -191,7 +205,7 @@ def show_hud(title, artist, current_stars, highlight_rated=False, auto_hide_ms=N
         return
 
     logging.info(
-        f"show_hud: '{title}' by {artist} (Stars: {current_stars}, Art: {album_art is not None})"
+        f"show_hud: '{title}' by {artist} (Stars: {current_stars}, Hist: {is_history}, Art: {album_art is not None})"
     )
 
     # Cancel pending hide
@@ -217,11 +231,15 @@ def show_hud(title, artist, current_stars, highlight_rated=False, auto_hide_ms=N
         border_color = "#00ff66"
         instruction = "Rating Updated Successfully!"
     else:
-        border_color = "#00d2ff"
-        instruction = "Press Numpad 1-5 to rate"
+        if is_history:
+            border_color = "#ffb000"  # Amber border in history mode
+            instruction = f"Press Numpad 1-5 to rate history (-{history_pos})"
+        else:
+            border_color = "#00d2ff"  # Cyan border in normal mode
+            instruction = "Press Numpad 1-5 to rate"
 
     # Create a brand new window with the correct content
-    hud_window = create_hud(title, artist, stars_str, instruction, border_color, album_art)
+    hud_window = create_hud(title, artist, stars_str, instruction, border_color, album_art, is_history, history_pos)
 
     # Set initial alpha
     hud_window.attributes("-alpha", 0.92)
@@ -255,7 +273,9 @@ def process_ui_queue():
                     show_hud(
                         msg["title"], msg["artist"], msg["stars"],
                         msg.get("highlight", False), msg.get("duration"),
-                        msg.get("album_art", None)
+                        msg.get("album_art", None),
+                        msg.get("is_history", False),
+                        msg.get("history_pos", None)
                     )
                 except Exception as e:
                     logging.error(f"Error in show_hud: {e}", exc_info=True)
@@ -304,41 +324,133 @@ def find_active_plexamp_session(plex):
     return None, None
 
 
+def navigate_history(direction):
+    """
+    direction: 1 for older (back/numpad 7), -1 for newer (forward/numpad 9)
+    """
+    global history_index, recent_tracks, current_track_id, ui_queue
+
+    with history_lock:
+        if not recent_tracks and history_index == -1:
+            logging.info("History is empty.")
+            return
+
+        if direction == 1:  # Go older
+            if history_index == -1:
+                history_index = 0
+            else:
+                history_index = min(len(recent_tracks) - 1, history_index + 1)
+        elif direction == -1:  # Go newer
+            if history_index == -1:
+                return
+            elif history_index == 0:
+                history_index = -1
+            else:
+                history_index -= 1
+
+        # Trigger HUD view
+        if history_index == -1:
+            # Reverted back to the currently playing song
+            if current_track_id:
+                try:
+                    plex = get_plex_connection()
+                    track = plex.fetchItem(current_track_id)
+                    title = track.title
+                    artist = track.originalTitle or track.grandparentTitle or "Unknown Artist"
+                    rating = getattr(track, "userRating", 0) or 0
+                    stars = rating / 2.0
+                    album_art = fetch_album_art(plex, track)
+                    ui_queue.put({
+                        "action": "show",
+                        "title": title,
+                        "artist": artist,
+                        "stars": stars,
+                        "album_art": album_art,
+                        "duration": 5000,
+                        "is_history": False
+                    })
+                except Exception as e:
+                    logging.error(f"Error restoring current track display: {e}")
+        else:
+            # Display history track
+            track_info = recent_tracks[history_index]
+            ui_queue.put({
+                "action": "show",
+                "title": track_info["title"],
+                "artist": track_info["artist"],
+                "stars": track_info["stars"],
+                "album_art": track_info["album_art"],
+                "duration": 5000,
+                "is_history": True,
+                "history_pos": history_index + 1
+            })
+
+
 def rate_song(stars):
-    global current_track_id
-    if not current_track_id:
-        logging.info("No active track to rate.")
+    global current_track_id, history_index, recent_tracks
+
+    target_id = None
+    is_history_rating = False
+    hist_idx = -1
+
+    with history_lock:
+        if history_index == -1:
+            target_id = current_track_id
+        else:
+            if history_index < len(recent_tracks):
+                track_info = recent_tracks[history_index]
+                target_id = track_info["id"]
+                is_history_rating = True
+                hist_idx = history_index
+
+    if not target_id:
+        logging.info("No active or historical track to rate.")
         return
+
     try:
         plex = get_plex_connection()
         if not plex:
             return
-        track = plex.fetchItem(current_track_id)
+
+        track = plex.fetchItem(target_id)
         if not track:
             return
+
         rating_value = float(stars * 2.0) if stars > 0 else None
         track.rate(rating_value)
-        logging.info(f"Rated '{track.title}': {stars} stars" if stars else f"Cleared rating on '{track.title}'")
-        
-        # Fetch album art for the rated track
+
+        rating_str = f"{stars} stars" if stars > 0 else "Cleared rating"
+        logging.info(f"Rated '{track.title}' (ID: {target_id}): {rating_str}")
+
+        # Update cache in recent history
+        if is_history_rating:
+            with history_lock:
+                if hist_idx < len(recent_tracks):
+                    recent_tracks[hist_idx]["stars"] = stars
+
+        # Fetch album art
         album_art = fetch_album_art(plex, track)
-        
+
         title = track.title
         artist = track.originalTitle or track.grandparentTitle or "Unknown Artist"
         ui_queue.put({
-            "action": "show", 
-            "title": title, 
-            "artist": artist, 
-            "stars": stars, 
+            "action": "show",
+            "title": title,
+            "artist": artist,
+            "stars": stars,
             "highlight": True,
-            "album_art": album_art
+            "album_art": album_art,
+            "is_history": is_history_rating,
+            "history_pos": hist_idx + 1 if is_history_rating else None
         })
+
     except Exception as e:
-        logging.error(f"Failed to rate: {e}")
+        logging.error(f"Failed to rate song: {e}")
 
 
 def setup_hotkeys():
     logging.info("Setting up global hotkeys...")
+    # 1. Setup rating keys
     for stars, key in HOTKEYS.items():
         if not key:
             continue
@@ -346,7 +458,6 @@ def setup_hotkeys():
         if key_lower in NUMPAD_MAP:
             sc = NUMPAD_MAP[key_lower]
             try:
-                # Differentiate standalone arrows vs numpad keys sharing same scan codes by checking e.is_keypad
                 keyboard.hook_key(sc, lambda e, s=stars: rate_song(s) if (e.event_type == "down" and getattr(e, "is_keypad", False)) else None)
                 logging.info(f"Hooked scan code {sc} ({key}) -> {stars} stars (keypad-only)")
             except Exception as e:
@@ -357,6 +468,21 @@ def setup_hotkeys():
                 logging.info(f"Hotkey '{key}' -> {stars} stars")
             except Exception as e:
                 logging.error(f"Hotkey failed for '{key}': {e}")
+
+    # 2. Setup history navigation keys
+    try:
+        sc_back = NUMPAD_MAP["numpad 7"]
+        keyboard.hook_key(sc_back, lambda e: navigate_history(1) if (e.event_type == "down" and getattr(e, "is_keypad", False)) else None)
+        logging.info("Hooked scan code 71 (numpad 7) -> History Back")
+    except Exception as e:
+        logging.error(f"Hook failed for numpad 7: {e}")
+
+    try:
+        sc_fwd = NUMPAD_MAP["numpad 9"]
+        keyboard.hook_key(sc_fwd, lambda e: navigate_history(-1) if (e.event_type == "down" and getattr(e, "is_keypad", False)) else None)
+        logging.info("Hooked scan code 73 (numpad 9) -> History Forward")
+    except Exception as e:
+        logging.error(f"Hook failed for numpad 9: {e}")
 
 
 def is_plexamp_running():
@@ -374,7 +500,7 @@ def is_plexamp_running():
 
 
 def monitor_loop():
-    global current_track_id, prompted_tracks
+    global current_track_id, prompted_tracks, history_index, recent_tracks
     logging.info("Watching player state...")
     errors = 0
     booted = False
@@ -395,6 +521,9 @@ def monitor_loop():
                     booted = False
                     current_track_id = None
                     plex = None
+                    with history_lock:
+                        recent_tracks.clear()
+                        history_index = -1
                 
                 time.sleep(5)
                 continue
@@ -415,18 +544,53 @@ def monitor_loop():
             errors = 0
 
             if session:
-                current_track_id = session.ratingKey
+                tid = session.ratingKey
                 duration = session.duration
                 offset = session.viewOffset
 
+                # Check if the active track changed to save the previous track to history
+                if current_track_id and current_track_id != tid:
+                    old_id = current_track_id
+                    with history_lock:
+                        history_index = -1  # Reset navigation to live song
+
+                    # Save finished track to history asynchronously
+                    def save_to_history(track_id):
+                        try:
+                            t_plex = get_plex_connection()
+                            if t_plex:
+                                old_track = t_plex.fetchItem(track_id)
+                                old_title = old_track.title
+                                old_artist = old_track.originalTitle or old_track.grandparentTitle or "Unknown Artist"
+                                old_rating = getattr(old_track, "userRating", 0) or 0
+                                old_stars = old_rating / 2.0
+                                old_art = fetch_album_art(t_plex, old_track)
+
+                                with history_lock:
+                                    # Avoid adding duplicate entries for consecutive events
+                                    if not recent_tracks or recent_tracks[0]["id"] != track_id:
+                                        recent_tracks.insert(0, {
+                                            "id": track_id,
+                                            "title": old_title,
+                                            "artist": old_artist,
+                                            "stars": old_stars,
+                                            "album_art": old_art
+                                        })
+                                        if len(recent_tracks) > 10:
+                                            recent_tracks.pop()
+                                        logging.info(f"Added to history: '{old_title}' (ID: {track_id})")
+                        except Exception as hist_err:
+                            logging.error(f"Error adding track {track_id} to history: {hist_err}")
+
+                    threading.Thread(target=save_to_history, args=(old_id,), daemon=True).start()
+
+                current_track_id = tid
+
                 if duration and offset:
                     remaining = (duration - offset) / 1000.0
-                    tid = session.ratingKey
-                    title = session.title
-                    artist = getattr(session, "originalTitle", None) or getattr(session, "grandparentTitle", "Unknown Artist")
 
                     if not booted:
-                        logging.info(f"Boot: '{title}' by {artist}")
+                        logging.info(f"Boot: '{session.title}' by {session.grandparentTitle}")
                         try:
                             track = plex.fetchItem(tid)
                             rating = getattr(track, "userRating", 0) or 0
@@ -438,8 +602,8 @@ def monitor_loop():
                         album_art = fetch_album_art(plex, session)
                         ui_queue.put({
                             "action": "show", 
-                            "title": title, 
-                            "artist": artist, 
+                            "title": session.title, 
+                            "artist": getattr(session, "originalTitle", None) or getattr(session, "grandparentTitle", "Unknown Artist"), 
                             "stars": stars, 
                             "duration": 5000,
                             "album_art": album_art
@@ -460,12 +624,12 @@ def monitor_loop():
                             
                             is_rated = stars > 0
                             if not ONLY_UNRATED or not is_rated:
-                                logging.info(f"OSD: '{title}' by {artist} ({remaining:.1f}s left, stars={stars})")
+                                logging.info(f"OSD: '{session.title}' by {getattr(session, 'originalTitle', None) or getattr(session, 'grandparentTitle', 'Unknown Artist')} ({remaining:.1f}s left, stars={stars})")
                                 album_art = fetch_album_art(plex, session)
                                 ui_queue.put({
                                     "action": "show", 
-                                    "title": title, 
-                                    "artist": artist, 
+                                    "title": session.title, 
+                                    "artist": getattr(session, "originalTitle", None) or getattr(session, "grandparentTitle", "Unknown Artist"), 
                                     "stars": stars,
                                     "album_art": album_art
                                 })
